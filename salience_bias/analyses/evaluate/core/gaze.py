@@ -3,7 +3,6 @@ from __future__ import annotations
 from typing import Any, Mapping, MutableMapping
 
 import numpy as np
-from scipy.ndimage import gaussian_filter
 
 
 def _extract_xy(eye_pos: Mapping[str, Any] | Any) -> tuple[np.ndarray, np.ndarray]:
@@ -18,6 +17,75 @@ def _extract_xy(eye_pos: Mapping[str, Any] | Any) -> tuple[np.ndarray, np.ndarra
     return xv, yv
 
 
+def _pair_param_np(x: Any, *, name: str = "param") -> tuple[float, float]:
+    """Return a length-2 pair from a scalar or length-2 input (NumPy-only)."""
+    arr = np.asarray(x, dtype=float).reshape(-1)
+    if arr.size == 1:
+        return float(arr[0]), float(arr[0])
+    if arr.size == 2:
+        return float(arr[0]), float(arr[1])
+    raise ValueError(f"Expected {name} to be scalar or length-2, got length {arr.size}")
+
+
+def _compute_mesh_centers_np(
+    h_range: tuple[float, float],
+    w_range: tuple[float, float],
+    h_nbin: int,
+    w_nbin: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Compute (ww, hh) mesh of bin centers, matching the legacy `gauss_gaze` convention.
+
+    Note: `h_range` may be decreasing (e.g. (17.5, -17.5)); we preserve that ordering.
+    """
+    h_edges = np.linspace(float(h_range[0]), float(h_range[1]), int(h_nbin) + 1, dtype=float)
+    w_edges = np.linspace(float(w_range[0]), float(w_range[1]), int(w_nbin) + 1, dtype=float)
+    h_centers = 0.5 * (h_edges[:-1] + h_edges[1:])
+    w_centers = 0.5 * (w_edges[:-1] + w_edges[1:])
+    ww, hh = np.meshgrid(w_centers, h_centers)  # shapes [H, W]
+    return ww, hh
+
+
+def _gauss_gaze_np(
+    g_hw: np.ndarray,
+    *,
+    h_range: tuple[float, float],
+    w_range: tuple[float, float],
+    h_nbin: int,
+    w_nbin: int,
+    sigma_hw: Any = (1.0, 1.0),
+    normalize: bool = True,
+) -> np.ndarray:
+    """
+    NumPy implementation of the legacy `gauss_gaze` kernel encoding.
+
+    - `g_hw`: gaze points with shape [..., 2], coordinates in the same units as ranges.
+      Convention: g_hw[..., 0] is h (y), g_hw[..., 1] is w (x).
+    - Returns: array with shape [..., H, W]
+    """
+    g_hw = np.asarray(g_hw, dtype=float)
+    if g_hw.shape == (0,):
+        g_hw = g_hw.reshape(0, 2)
+    if g_hw.ndim < 1 or g_hw.shape[-1] != 2:
+        raise ValueError(f"gaze points must have shape [..., 2], got {g_hw.shape}")
+
+    sigma_h, sigma_w = _pair_param_np(sigma_hw, name="sigma_hw")
+    ww, hh = _compute_mesh_centers_np(h_range, w_range, int(h_nbin), int(w_nbin))
+
+    # Broadcast to [..., H, W]
+    dh = hh[None, :, :] - g_hw[..., 0][..., None, None]
+    dw = ww[None, :, :] - g_hw[..., 1][..., None, None]
+    gauss = np.exp(-0.5 * ((dh / sigma_h) ** 2 + (dw / sigma_w) ** 2))
+
+    if bool(normalize):
+        bin_h = (float(h_range[1]) - float(h_range[0])) / float(h_nbin)
+        bin_w = (float(w_range[1]) - float(w_range[0])) / float(w_nbin)
+        area_bin = abs(bin_h * bin_w)
+        gauss = gauss * (area_bin / (2.0 * np.pi * sigma_h * sigma_w))
+
+    return np.asarray(gauss, dtype=np.float64)
+
+
 def make_gaze_map(
     eye_pos: Mapping[str, Any] | Any,
     *,
@@ -26,9 +94,11 @@ def make_gaze_map(
     gauss_params: MutableMapping[str, Any] | None = None,
 ) -> np.ndarray:
     """
-    Blur raw gaze points into a density map [H, W].
+    Encode gaze points into a [H, W] Gaussian field.
 
-    Public subset implementation that avoids internal dependencies.
+    This is a public subset implementation intended to match the legacy `gazebo.utils.gauss_gaze`
+    behavior used in the original (private) codebase: evaluate a Gaussian at **bin centers**
+    for each fixation, then average across fixations.
 
     `eye_pos` may be:
       - dict with keys 'x' and 'y' (1d arrays or lists of equal length)
@@ -36,10 +106,15 @@ def make_gaze_map(
 
     Supported `gauss_params` keys (all optional):
       - h_nbin, w_nbin: output grid size (defaults to image_shape)
-      - h_range: (max, min) in the y-coordinate system (matches original code convention)
-      - w_range: (min, max) in the x-coordinate system
-      - sigma: Gaussian blur sigma in *bins*
-      - normalize: if True, normalize map to sum to 1 (default False)
+      - h_range: (max, min) or (min, max) range for y/height coordinates
+      - w_range: (min, max) or (max, min) range for x/width coordinates
+      - sigma_hw: (sigma_h, sigma_w) in the same units as `h_range`/`w_range`
+      - normalize: if True, apply continuous-Gaussian normalization so the Riemann sum over the
+        grid approximates 1 when mass lies within the domain (default False here to preserve
+        earlier evaluation usage patterns in this repo).
+
+    Compatibility notes:
+      - If `sigma` is passed, it is treated as a scalar `sigma_hw=(sigma, sigma)` in coordinate units.
     """
     h_img, w_img = image_shape
     params = dict(gauss_params) if gauss_params is not None else {}
@@ -51,34 +126,31 @@ def make_gaze_map(
     h_range = params.get("h_range", (h / 2, -h / 2))
     w_range = params.get("w_range", (-w / 2, w / 2))
 
-    # Convert to numpy.histogram2d expected (min, max) ranges.
-    y_min = float(min(h_range[0], h_range[1]))
-    y_max = float(max(h_range[0], h_range[1]))
-    x_min = float(min(w_range[0], w_range[1]))
-    x_max = float(max(w_range[0], w_range[1]))
-
     xv, yv = _extract_xy(eye_pos)
+    x_flat = xv.reshape(-1)
+    y_flat = yv.reshape(-1)
+    if x_flat.size == 0:
+        return np.zeros((h, w), dtype=np.float64)
 
-    # histogram2d returns shape [y_bins, x_bins]
-    hist, _, _ = np.histogram2d(
-        yv.reshape(-1),
-        xv.reshape(-1),
-        bins=(h, w),
-        range=((y_min, y_max), (x_min, x_max)),
+    pts_hw = np.stack([y_flat, x_flat], axis=-1)  # (h, w) = (y, x)
+
+    # sigma compatibility: treat `sigma` argument as sigma_hw scalar in coordinate units
+    sigma_hw = params.get("sigma_hw", None)
+    if sigma_hw is None:
+        if sigma is not None:
+            sigma_hw = (float(sigma), float(sigma))
+        else:
+            sigma_hw = (1.0, 1.0)
+
+    gaze_stack = _gauss_gaze_np(
+        pts_hw,
+        h_range=(float(h_range[0]), float(h_range[1])),
+        w_range=(float(w_range[0]), float(w_range[1])),
+        h_nbin=h,
+        w_nbin=w,
+        sigma_hw=sigma_hw,
+        normalize=bool(params.get("normalize", False)),
     )
 
-    sig = sigma
-    if sig is None:
-        sig = params.get("sigma", None)
-    if sig is None:
-        # Light default blur; callers should pass explicit sigma/gauss_params for real experiments.
-        sig = 1.0
-
-    out = gaussian_filter(hist.astype(np.float64), sigma=float(sig), mode="constant")
-
-    if bool(params.get("normalize", False)):
-        s = float(out.sum())
-        if s > 0:
-            out = out / s
-
-    return out
+    # gaze_stack is [T, H, W]; match evaluation API contract: return [H, W] average map
+    return np.mean(gaze_stack, axis=0, dtype=np.float64)
