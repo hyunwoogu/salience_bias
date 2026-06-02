@@ -1,0 +1,18 @@
+# Local-only material (notebooks with outputs, raw data, logs)
+private/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+dist/
+build/
+
+# Notebooks
+.ipynb_checkpoints/
+
+# Data and secrets
+*.edf
+.env
+.env.*

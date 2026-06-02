@@ -1,0 +1,7 @@
+# --dataset-name steer-search; target microwave|chair; file = search_*.jpg basenames
+n_trials: 100
+rules:
+  - { block: 1, target: microwave, file: "search_0001_{idx:04d}.jpg" }
+  - { block: 2, target: microwave, file: "search_0002_{idx:04d}.jpg" }
+  - { block: 3, target: microwave, file: "search_0001_{idx:04d}.jpg", expn_offset: 100 }
+  - { block: 4, target: microwave, file: "search_0002_{idx:04d}.jpg", expn_offset: 100 }
